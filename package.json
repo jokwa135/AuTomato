@@ -1,0 +1,33 @@
+{
+    "name":  "automato",
+    "version":  "0.3.2",
+    "description":  "AuTomato local creative workspace with an agent CLI",
+    "main":  "desktop/main.cjs",
+    "private":  true,
+    "license": "MIT",
+    "scripts":  {
+                    "start":  "electron desktop/main.cjs",
+                    "pack":  "node desktop/build-local.cjs",
+                    "installer:win": "node desktop/build-release.cjs",
+                    "installer:mac": "node desktop/build-release.cjs --mac-installer"
+                },
+    "build":  {
+                  "appId":  "com.automatobot.desktop",
+                  "productName":  "AuTomato",
+                  "directories":  {
+                                      "output":  "dist/automato"
+                                  },
+                  "files":  [
+                                "desktop/**/*",
+                                "package.json"
+                            ],
+                  "win":  {
+                              "signAndEditExecutable":  false,
+                              "icon":  "desktop/assets/automato.png"
+                          }
+              },
+    "devDependencies":  {
+                            "electron":  "39.2.7",
+                            "electron-builder":  "26.0.12"
+                        }
+}

@@ -1,0 +1,44 @@
+# Only the current application source belongs in this repository.
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/LICENSE
+!/THIRD_PARTY_NOTICES.md
+!/contributions.md
+!/licenses/
+!/package.json
+!/package-lock.json
+!/Start AuTomato.cmd
+!/desktop/
+!/agent-harness/
+!/skills/
+
+# Never version local sessions, credentials, caches or generated artifacts.
+**/node_modules/
+**/__pycache__/
+**/.pytest_cache/
+**/*.pyc
+**/*.egg-info/
+**/.venv/
+**/venv/
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.pfx
+**/*.p12
+**/*.log
+**/bridge.json
+**/Cookies*
+**/Login Data*
+**/Local State
+**/profile/
+**/profiles/
+**/cache/
+**/downloads/
+**/previews/
+**/output/
+# Local verification history is not a distributable source document.
+/agent-harness/cli_anything/automato/tests/TEST.md
+/desktop/launch-test.ps1

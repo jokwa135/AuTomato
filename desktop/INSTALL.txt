@@ -1,0 +1,37 @@
+AuTomato 0.3.2 installers
+
+WINDOWS
+Keep Install AuTomato Windows.cmd beside AuTomato-0.3.2-Windows-Setup.exe.
+Run the CMD launcher. The setup wizard suggests %LOCALAPPDATA%\Programs\AuTomato
+or your existing installation, and lets you choose another writable folder.
+No specific drive letter is required. On first launch, choose a data folder
+on any writable drive. Settings > Storage can copy the workspace to an empty folder
+after restarting. The original data is preserved.
+Open Start AuTomato.cmd in the selected app folder after installation.
+The app is listed in Windows Installed Apps. Uninstalling preserves app files
+in a dated sibling backup folder and keeps your separate data folder.
+The default data location is %LOCALAPPDATA%\AuTomato. If upgrading from an older
+release with a different data location, select your previous workspace through
+the first-launch picker. Existing workspace folders can be selected without copying.
+
+MAC
+Extract AuTomato-0.3.2-Mac-Installer.zip, then read its READ ME.txt and open
+Install AuTomato.command. It detects Apple Silicon or Intel and downloads
+the matching native Electron runtime from the official Electron GitHub release.
+Its checksum is checked before installation. App code is included in the ZIP.
+The target is ~/Applications/AuTomato.app. It signs the app locally on that Mac.
+Choose your data folder on first launch; change it later in Settings > Storage.
+The installer script and payload were checked on Windows; Mac execution and
+provider logins remain unverified. No Apple Developer ID or notarization is
+included. No paid services, cloud servers or subscriptions are created.
+
+CLI
+The Windows CLI reads the registered install location and checks the standard
+per-user application folder. AUTOMATO_APP_EXECUTABLE selects a custom binary. The Python
+CLI harness is also included in the app's resources/cli-anything folder (Mac:
+Contents/Resources/cli-anything). Python 3.10+ and Click are separate optional
+requirements for installing that harness on another machine.
+
+SIGNING
+These packages do not have a purchased code-signing certificate. A downloaded
+installer may require the operating system's normal user approval.

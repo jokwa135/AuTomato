@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'"><title>AuTomato Appearance</title><link rel="stylesheet" href="style.css"><link rel="stylesheet" href="preferences.css"><link rel="stylesheet" href="appearance.css"></head>
+<body class="appearance-page">
+<header class="appearance-header"><img src="assets/automato.png" alt=""><span>AuTomato</span><button id="close" aria-label="Close appearance">×</button></header>
+<main class="appearance-content"><nav class="settings-tabs" aria-label="Settings"><button data-settings-tab="appearance" aria-selected="true">Appearance</button><button data-settings-tab="storage" aria-selected="false">Storage</button></nav><section id="appearanceSection"><h1>Appearance</h1><p class="appearance-intro">Make a little space that feels like you.</p>
+<span class="group-label">Visual style</span>
+<section class="settings-group mode-row"><span>Mode</span><div class="mode-options" role="group" aria-label="Color mode">
+<button class="mode-choice" data-mode="system" aria-label="System mode" title="Follow system"><span class="mode-preview system-preview"><i></i><i></i><i></i></span><small>System</small></button>
+<button class="mode-choice" data-mode="light" aria-label="Light mode" title="Light"><span class="mode-preview light-preview"><i></i><i></i><i></i></span><small>Light</small></button>
+<button class="mode-choice" data-mode="dark" aria-label="Dark mode" title="Dark"><span class="mode-preview dark-preview"><i></i><i></i><i></i></span><small>Dark</small></button>
+</div></section>
+<section class="settings-group color-settings">
+<label class="setting-row"><span>Theme</span><select id="theme" aria-label="Theme"></select></label>
+<div class="setting-row"><label for="accentHex">Accent</label><div class="color-control"><input type="color" id="accent" aria-label="Choose accent color"><input id="accentHex" class="hex-input" aria-label="Accent hex color" maxlength="7" spellcheck="false"></div></div>
+<div class="setting-row"><label for="backgroundHex">Background</label><div class="color-control"><input type="color" id="background" aria-label="Choose background color"><input id="backgroundHex" class="hex-input" aria-label="Background hex color" maxlength="7" spellcheck="false"></div></div>
+<div class="setting-row"><label for="foregroundHex">Foreground</label><div class="color-control"><input type="color" id="foreground" aria-label="Choose foreground color"><input id="foregroundHex" class="hex-input" aria-label="Foreground hex color" maxlength="7" spellcheck="false"></div></div>
+<label class="setting-row"><span>Font</span><select id="font" aria-label="Font"></select></label>
+</section>
+<div class="appearance-footer"><span id="saved" role="status">Saved automatically on this computer</span><button id="reset">Reset to default</button></div>
+<p class="appearance-note">Styles apply to your AuTomato workspace. Each studio keeps its own website appearance.</p>
+</section><section id="storageSection" hidden><h1>Storage</h1><p class="appearance-intro">Give your workspace a place of its own.</p><section class="settings-group storage-card"><span class="group-label">DATA FOLDER</span><code id="storagePath" class="folder-path"></code><div class="storage-actions"><button id="storageOpen" class="storage-button">Open folder</button><button id="storageChoose" class="storage-button">Change folder…</button></div></section><p class="storage-note">Your studio sessions, assets, downloads and preferences live here. To change folders, select an empty location. AuTomato copies the workspace after restarting and keeps the original folder.</p><p id="storageOverride" class="storage-note" hidden>This launch uses AUTOMATO_DATA_DIR. Close AuTomato and remove that override to change the saved location here.</p><p id="storageStatus" class="storage-note" role="status"></p></section></main><script src="preferences.cjs"></script><script src="appearance.cjs"></script></body></html>

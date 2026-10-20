@@ -1,0 +1,8 @@
+<!doctype html><meta charset="utf-8"><title>AuTomato local test</title>
+<style>body{font:18px system-ui;padding:36px;background:#fbf5e9;color:#143d2a}button,input,a{display:block;font:inherit;margin:16px 0;padding:10px}#result{font-weight:600}.space{height:1500px}</style>
+<h1>AuTomato local connection</h1><p>This is a local test page, not a generation service.</p>
+<button onclick="document.querySelector('#result').textContent='Click received'">Test click</button>
+<label>Test text<input aria-label="Test text" oninput="document.querySelector('#typed').textContent=this.value"></label>
+<p id="typed"></p><input aria-label="Test file" type="file" onchange="document.querySelector('#attached').textContent=this.files[0]?.name">
+<p id="attached"></p><a href="fixture-popup.html" target="_blank">Open test tab</a><p id="result">Waiting</p><div class="space"></div><p>Scroll destination</p>
+<input type="file" style="display:none" aria-label="Hidden upload" accept="image/png" onchange="document.querySelector('#attached').textContent='hidden:'+this.files[0]?.name">
