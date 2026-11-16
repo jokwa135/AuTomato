@@ -38,12 +38,24 @@ function render(state) {
   if (!studios.querySelector('[data-studio]')) for (const studio of state.studios) {
     const button = document.createElement('button'); button.dataset.studio = studio.id;
     const icon = document.createElement('img'); icon.src = `assets/${({ flow: 'flow.png', clipscript: 'clipscript.png' })[studio.id] || studio.id + '.ico'}`; icon.alt = ''; icon.onerror = () => icon.hidden = true;
-    button.append(icon, document.createTextNode(studio.name)); button.onclick = () => run('switch', { studio: studio.id }); studios.insertBefore(button, $('#studiosResize'));
+    const lock = document.createElement('span'); lock.className = 'studio-lock'; lock.setAttribute('aria-hidden', 'true');
+    const nap = document.createElement('span'); nap.className = 'studio-nap'; nap.textContent = 'zz'; nap.setAttribute('aria-hidden', 'true');
+    const suspend = document.createElement('span'); suspend.className = 'studio-suspend'; suspend.textContent = '×'; suspend.setAttribute('role', 'button'); suspend.tabIndex = 0;
+    suspend.title = 'Suspend ' + studio.name + ' to free memory'; suspend.setAttribute('aria-label', suspend.title);
+    const doSuspend = async event => { event.stopPropagation(); event.preventDefault(); const result = await run('suspend', { studio: studio.id }); if (result) message(studio.name + ' suspended'); };
+    suspend.onclick = doSuspend; suspend.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') doSuspend(event); };
+    button.append(icon, document.createTextNode(studio.name), lock, nap, suspend); button.onclick = () => run('switch', { studio: studio.id }); studios.insertBefore(button, $('#studiosResize'));
   }
-  for (const button of studios.querySelectorAll('[data-studio]')) { const active = button.dataset.studio === state.active; button.classList.toggle('active', active); button.setAttribute('aria-pressed', String(active)); }
+  for (const button of studios.querySelectorAll('[data-studio]')) {
+    const active = button.dataset.studio === state.active; button.classList.toggle('active', active); button.setAttribute('aria-pressed', String(active));
+    const info = state.studios.find(studio => studio.id === button.dataset.studio) || {};
+    button.classList.toggle('loaded', !!info.loaded); button.classList.toggle('suspended', !!info.suspended); button.classList.toggle('leased', !!info.leasedBy);
+    button.title = info.leasedBy ? `${info.name}: in use by agent ${info.leasedBy}` : info.suspended ? `${info.name}: suspended. Click to reload` : (info.name || '');
+  }
   const tabs = state.tabs.filter(tab => tab.studio === state.active), selected = tabs.find(tab => tab.active);
   $('#pageTitle').textContent = selected?.title || state.studios.find(studio => studio.id === state.active)?.name || 'Local test';
-  $('#pageStatus').textContent = selected?.error || (selected?.loading ? 'Loading website…' : selected?.url || '');
+  const activeInfo = state.studios.find(studio => studio.id === state.active);
+  $('#pageStatus').textContent = !selected && activeInfo?.suspended ? `Suspended. Click ${activeInfo.name} to reload.` : selected?.error || (selected?.loading ? 'Loading website…' : selected?.url || '');
   const tabSignature = JSON.stringify(tabs.map(tab => [tab.id, tab.active, tab.title]));
   if (tabSignature !== lastTabs) { lastTabs = tabSignature; $('#tabs').replaceChildren();
   if (tabs.length > 1) for (const tab of tabs) {

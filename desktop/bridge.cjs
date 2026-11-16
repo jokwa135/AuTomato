@@ -27,11 +27,19 @@ function compactAX(nodes, limit = 250) {
       };
     });
 }
+// Machine-readable codes let agents branch on failures instead of parsing prose.
+function errorCode(message = '') {
+  if (/Stale element reference/i.test(message)) return 'STALE_REF';
+  if (/not visible/i.test(message)) return 'NOT_VISIBLE';
+  if (/No active website tab|Tab not found/i.test(message)) return 'NO_TAB';
+  if (/timed out|timeout/i.test(message)) return 'TIMEOUT';
+  return 'ERROR';
+}
 function createBridge(dataRoot, dispatch) {
   const endpoint = bridgeAddress(dataRoot);
   const server = net.createServer(socket => {
     let data = ''; let handled = false;
-    socket.setTimeout(20000, () => socket.destroy());
+    socket.setTimeout(90000, () => socket.destroy());
     socket.on('error', () => {});
     socket.on('data', chunk => {
       if (handled) return;
@@ -44,7 +52,7 @@ function createBridge(dataRoot, dispatch) {
           const request = JSON.parse(data.slice(0, end));
           const result = await dispatch(request.command, request.args || {});
           socket.end(JSON.stringify({ ok: true, result }) + '\n');
-        } catch (error) { socket.end(JSON.stringify({ ok: false, error: error.message }) + '\n'); }
+        } catch (error) { socket.end(JSON.stringify({ ok: false, error: error.message, code: error.code || errorCode(error.message), ...(error.retryAfter != null ? { retryAfter: error.retryAfter } : {}), ...(error.leasedBy ? { leasedBy: error.leasedBy } : {}) }) + '\n'); }
       })();
     });
   });
