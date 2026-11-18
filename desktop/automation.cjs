@@ -24,11 +24,14 @@ class PageAutomation {
     walk(tree.frameTree);
     const nodes = []; const warnings = [];
     const limit = Math.min(1000, Math.max(10, Number(args.limit) || 250));
+    // offset skips that many compacted nodes per frame, so callers can read past the 1000-node window
+    // (e.g. a dialog rendered after a long list). Refs are still issued only for returned nodes.
+    const offset = Math.max(0, Math.floor(Number(args.offset) || 0));
     for (const frame of frames) {
       if (args.frame && frame.id !== args.frame) continue;
       try {
         const result = await this.cdp(tab, 'Accessibility.getFullAXTree', { frameId: frame.id });
-        for (const node of compactAX(result.nodes, 1000)) {
+        for (const node of compactAX(result.nodes, 1000 + offset).slice(offset)) {
           if (args.query && !`${node.role} ${node.name}`.toLowerCase().includes(String(args.query).toLowerCase())) continue;
           if (nodes.length >= limit) break;
           const ref = node.backendId ? `s${snapshot}e${nodes.length + 1}` : undefined;
