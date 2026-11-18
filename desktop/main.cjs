@@ -19,13 +19,20 @@ app.setPath('sessionData', path.join(DATA, 'profile'));
 app.setPath('temp', path.join(DATA, 'temp'));
 app.setPath('logs', path.join(DATA, 'logs'));
 app.commandLine.appendSwitch('disk-cache-dir', path.join(DATA, 'cache'));
+// Keep studios rendering while the window is covered or minimized, so agents can work without it on screen.
+app.commandLine.appendSwitch('disable-renderer-backgrounding');
+app.commandLine.appendSwitch('disable-background-timer-throttling');
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
+app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
 const STUDIOS = {
   higgsfield: { name: 'Higgsfield', url: 'https://higgsfield.ai/', partition: 'persist:higgsfield' },
   flow: { name: 'Flow', url: 'https://flow.google.com/', partition: 'persist:flow' },
   symphony: { name: 'Symphony', url: 'https://ads.tiktok.com/creative/creativestudio/home/en', partition: 'persist:symphony' },
   tiktok: { name: 'TikTok Studio', url: 'https://www.tiktok.com/tiktokstudio/upload', partition: 'persist:tiktok' },
   capcut: { name: 'CapCut Web', url: 'https://www.capcut.com/my-edit', partition: 'persist:capcut' },
-  clipscript: { name: 'ClipScript', url: 'https://clipscript.jsxcreatives.com/', partition: 'persist:clipscript' }
+  clipscript: { name: 'ClipScript', url: 'https://clipscript.jsxcreatives.com/', partition: 'persist:clipscript' },
+  // v7 (2026-11-16): product pages and their customer reviews, kept in their own session away from TikTok Studio posting.
+  shop: { name: 'TikTok Shop', url: 'https://www.tiktok.com/shop', partition: 'persist:shop' }
 };
 const fixtureMode = process.env.AUTOMATO_TEST_MODE === '1';
 const settingsFile = path.join(DATA, 'layout.json');
@@ -36,12 +43,140 @@ try { appearance = normalizeAppearance(JSON.parse(fs.readFileSync(appearanceFile
 let window, appearanceWindow, setupWindow, bridge, restartPending = false, activeStudio = fixtureMode ? 'test' : 'higgsfield', nextId = 1;
 let surface = { x: 280, y: 152, width: 900, height: 580 };
 let quitting = false;
-let assetsRevision = 0, resizing = false, resizeToken = 0;
+let assetsRevision = 0, resizing = false, resizeToken = 0, frontTab = null;
 const tabs = new Map(); const selected = new Map(); const sessions = new Set();
 const automation = new PageAutomation();
 
+// ---- Multi-agent studios, suspension and download attribution ----
+const LEASE_MS = 10 * 60 * 1000;
+const leases = new Map();          // studio -> { owner, expires }
+const suspended = new Map();       // studio -> { url, title, at, reason }
+const activeDownloads = new Map(); // studio -> count of downloads in progress
+const downloadIndexFile = path.join(DATA, 'downloads-index.json');
+let downloadLog = [];
+try { downloadLog = JSON.parse(fs.readFileSync(downloadIndexFile, 'utf8')); if (!Array.isArray(downloadLog)) downloadLog = []; } catch {}
+const suspendFile = path.join(DATA, 'suspend.json');
+let suspendSettings = { enabled: true, idleMinutes: 15 };
+try { suspendSettings = normalizeSuspend(JSON.parse(fs.readFileSync(suspendFile, 'utf8'))); } catch {}
+
+function normalizeSuspend(value = {}, base = { enabled: true, idleMinutes: 15 }) {
+  const enabled = typeof value.enabled === 'boolean' ? value.enabled : base.enabled;
+  const minutes = Number(value.idleMinutes);
+  return { enabled, idleMinutes: Number.isFinite(minutes) && minutes >= 1 && minutes <= 720 ? Math.round(minutes) : base.idleMinutes };
+}
+function codedError(code, message, extra = {}) { const error = new Error(message); error.code = code; Object.assign(error, extra); return error; }
+function studioName(id) { return STUDIOS[id]?.name || id; }
+function knownStudio(id) { if (!STUDIOS[id] && !(fixtureMode && id === 'test')) throw codedError('BAD_ARGS', 'Unknown studio'); return id; }
+function partitionStudio(partition) { return Object.keys(STUDIOS).find(id => STUDIOS[id].partition === partition) || 'test'; }
+function lease(studio) {
+  const held = leases.get(studio);
+  if (held && held.expires <= Date.now()) { leases.delete(studio); return null; }
+  return held || null;
+}
+function checkLease(studio, owner) {
+  const held = lease(studio);
+  if (held && held.owner !== owner) {
+    const seconds = Math.ceil((held.expires - Date.now()) / 1000);
+    throw codedError('STUDIO_LEASED', `${studioName(studio)} is in use by agent ${held.owner} (frees in ${seconds}s)`, { retryAfter: seconds, leasedBy: held.owner });
+  }
+  if (owner) { const fresh = !held; leases.set(studio, { owner: String(owner), expires: Date.now() + LEASE_MS }); if (fresh) publish(); }
+}
+function touch(tab) { if (tab) tab.lastUsed = Date.now(); }
+function studioTabs(studio) { return [...tabs.values()].filter(tab => tab.studio === studio && !tab.view.webContents.isDestroyed()); }
+function saveDownloadIndex() {
+  if (downloadLog.length > 2000) downloadLog = downloadLog.slice(-2000);
+  try { fs.writeFileSync(downloadIndexFile, JSON.stringify(downloadLog)); } catch {}
+}
+function waitLoaded(tab, ms) {
+  const wc = tab.view.webContents;
+  if (!wc.isLoading() && wc.getURL()) return Promise.resolve(true);
+  return new Promise(resolve => {
+    const done = value => { clearTimeout(timer); wc.removeListener('did-stop-loading', stop); resolve(value); };
+    const stop = () => done(true);
+    const timer = setTimeout(() => done(false), ms);
+    wc.on('did-stop-loading', stop);
+  });
+}
+// Create or wake a studio in the background without changing what is on screen.
+async function ensureTab(studio) {
+  knownStudio(studio);
+  const existing = tabs.get(selected.get(studio));
+  if (existing && !existing.view.webContents.isDestroyed()) return existing;
+  const saved = suspended.get(studio);
+  suspended.delete(studio);
+  const url = saved?.url || (studio === 'test' ? require('node:url').pathToFileURL(path.join(__dirname, 'fixture.html')).href : STUDIOS[studio].url);
+  const tab = createTab(studio, url);
+  await waitLoaded(tab, 20000);
+  return tab;
+}
+async function targetTab(args = {}) {
+  let tab;
+  if (args.tab != null) {
+    tab = tabs.get(Number(args.tab));
+    if (!tab || tab.view.webContents.isDestroyed()) throw codedError('NO_TAB', 'Tab not found');
+    checkLease(tab.studio, args.owner);
+  } else if (args.studio) {
+    checkLease(knownStudio(args.studio), args.owner);
+    tab = await ensureTab(args.studio);
+  } else {
+    tab = assertTab();
+    checkLease(tab.studio, args.owner);
+  }
+  touch(tab);
+  return tab;
+}
+// Element references remember their tab, so ref-based commands never depend on what is on screen.
+function refTab(args = {}) {
+  const value = automation.references.get(args.ref);
+  if (!value || value.tab.view.webContents.isDestroyed()) throw codedError('STALE_REF', 'Stale element reference. Inspect the current tab again.');
+  const tab = value.tab;
+  if (args.studio && tab.studio !== args.studio) throw codedError('BAD_ARGS', `That reference belongs to ${studioName(tab.studio)}, not ${studioName(args.studio)}`);
+  checkLease(tab.studio, args.owner);
+  touch(tab);
+  return tab;
+}
+function suspendStudio(id, reason = 'manual') {
+  if (!STUDIOS[id]) throw codedError('BAD_ARGS', 'Unknown studio');
+  const held = lease(id);
+  if (held) throw codedError('STUDIO_LEASED', `${studioName(id)} is in use by agent ${held.owner}; it cannot be suspended until released`, { retryAfter: Math.ceil((held.expires - Date.now()) / 1000), leasedBy: held.owner });
+  if ((activeDownloads.get(id) || 0) > 0) throw codedError('BUSY', `${studioName(id)} is still downloading a file`);
+  const own = studioTabs(id);
+  if (!own.length) return { suspended: id, already: suspended.has(id) };
+  // Only automatic suspension spares a studio that is playing audio; a manual suspend is an explicit request.
+  if (reason === 'idle' && own.some(tab => tab.view.webContents.isCurrentlyAudible())) throw codedError('BUSY', `${studioName(id)} is playing audio`);
+  const chosen = tabs.get(selected.get(id)) || own.at(-1);
+  suspended.set(id, { url: chosen.view.webContents.getURL() || STUDIOS[id].url, title: chosen.view.webContents.getTitle(), at: Date.now(), reason });
+  for (const tab of own) {
+    try { window.contentView.removeChildView(tab.view); } catch {}
+    tab.view.webContents.close();
+  }
+  publish();
+  return { suspended: id, reason };
+}
+function autoSuspend() {
+  if (!suspendSettings.enabled || !window || window.isDestroyed()) return;
+  const now = Date.now(), idleMs = suspendSettings.idleMinutes * 60000;
+  for (const id of Object.keys(STUDIOS)) {
+    if (id === activeStudio) continue;
+    const own = studioTabs(id);
+    if (!own.length) continue;
+    const last = Math.max(...own.map(tab => tab.lastUsed || 0));
+    if (now - last < idleMs) continue;
+    try { suspendStudio(id, 'idle'); } catch {}
+  }
+}
+function studioInfo(id) {
+  const held = lease(id), own = studioTabs(id), now = Date.now();
+  const last = own.length ? Math.max(...own.map(tab => tab.lastUsed || 0)) : 0;
+  return {
+    id, name: STUDIOS[id].name, loaded: own.length > 0, suspended: suspended.has(id),
+    leasedBy: held?.owner || null, leaseSeconds: held ? Math.ceil((held.expires - now) / 1000) : 0,
+    idleSeconds: own.length ? Math.round((now - last) / 1000) : null
+  };
+}
+
 function currentTab() { return tabs.get(selected.get(activeStudio)); }
-function assertTab() { const tab = currentTab(); if (!tab || tab.view.webContents.isDestroyed()) throw new Error('No active website tab'); return tab; }
+function assertTab() { const tab = currentTab(); if (!tab || tab.view.webContents.isDestroyed()) throw codedError('NO_TAB', suspended.has(activeStudio) ? `${studioName(activeStudio)} is suspended; switch to it or target it with studio to wake it` : 'No active website tab'); return tab; }
 function uniquePath(folder, name) {
   const parsed = path.parse(path.basename(name)); let target = path.join(folder, parsed.base); let i = 1;
   while (fs.existsSync(target)) target = path.join(folder, `${parsed.name}-${i++}${parsed.ext}`);
@@ -50,9 +185,9 @@ function uniquePath(folder, name) {
 function state() {
   const tab = currentTab();
   return { name: 'AuTomato', version: require('../package.json').version, local: true, active: activeStudio,
-    studios: Object.entries(STUDIOS).map(([id, studio]) => ({ id, name: studio.name })),
+    studios: Object.keys(STUDIOS).map(studioInfo),
     tabs: [...tabs.values()].map(t => ({ id: t.id, studio: t.studio, active: t.id === selected.get(t.studio), title: t.view.webContents.getTitle(), url: safeUrl(t.view.webContents.getURL()), loading: t.view.webContents.isLoading(), error: t.error || null })),
-    layout, appearance, assetsRevision, bounds: tab?.view.getBounds(), dataDir: DATA, assetsDir: path.join(DATA, 'assets'), downloadDir: path.join(DATA, 'downloads') };
+    suspendSettings, layout, appearance, assetsRevision, bounds: tab?.view.getBounds(), dataDir: DATA, assetsDir: path.join(DATA, 'assets'), downloadDir: path.join(DATA, 'downloads') };
 }
 function publish() {
   const snapshot = state();
@@ -61,12 +196,26 @@ function publish() {
 function updateBounds() {
   if (!window || window.isDestroyed()) return;
   const size = window.getContentBounds();
-  const x = Math.max(0, Math.round(surface.x)), y = Math.max(0, Math.round(surface.y));
-  const bounds = { x, y, width: Math.max(1, Math.min(Math.round(surface.width), size.width - x)), height: Math.max(1, Math.min(Math.round(surface.height), size.height - y)) };
+  let x = Math.max(0, Math.round(surface.x)), y = Math.max(0, Math.round(surface.y));
+  let w = Math.max(300, Math.round(surface.width || 900));
+  let h = Math.max(200, Math.round(surface.height || 580));
+  const bounds = { x, y, width: Math.max(300, Math.min(w, Math.max(1, size.width - x))), height: Math.max(200, Math.min(h, Math.max(1, size.height - y))) };
+  const current = currentTab();
   for (const tab of tabs.values()) {
-    const visible = tab === currentTab() && !resizing;
-    if (visible && JSON.stringify(tab.bounds) !== JSON.stringify(bounds)) { tab.view.setBounds(bounds); tab.bounds = bounds; }
+    if (tab.view.webContents.isDestroyed()) continue;
+    // Every studio stays "visible" to Chromium (occlusion detection is off) so background pages render,
+    // lazy-load and paint like the one on screen; the on-screen studio is simply stacked on top.
+    // With no on-screen tab (its studio suspended) the others hide so they don't show through.
+    const visible = !resizing && !!current && !current.view.webContents.isDestroyed();
+    // A tab can ask for a minimum layout width (viewport command). Its page area then extends past the window's
+    // right edge: the page lays out wide and refs/clicks work, whatever size or monitor the window is on.
+    const own = tab.minWidth > bounds.width ? { ...bounds, width: tab.minWidth } : bounds;
+    if (JSON.stringify(tab.bounds) !== JSON.stringify(own)) { tab.view.setBounds(own); tab.bounds = own; }
     if (visible !== tab.visible) { tab.view.setVisible(visible); tab.visible = visible; }
+  }
+  if (current && !current.view.webContents.isDestroyed() && frontTab !== current.id) {
+    try { window.contentView.addChildView(current.view); } catch {}
+    frontTab = current.id;
   }
 }
 function configureSession(partition) {
@@ -77,22 +226,33 @@ function configureSession(partition) {
   s.on('will-download', (_event, item) => {
     const target = uniquePath(path.join(DATA, 'downloads'), item.getFilename());
     item.setSavePath(target);
-    item.once('done', () => { assetsRevision++; publish(); });
+    const studio = partitionStudio(partition);
+    const record = { file: target, studio, owner: lease(studio)?.owner || null, url: safeUrl(item.getURL()), started: Date.now(), state: 'progressing' };
+    downloadLog.push(record); activeDownloads.set(studio, (activeDownloads.get(studio) || 0) + 1); saveDownloadIndex();
+    item.once('done', (_e, result) => {
+      record.state = result; record.finished = Date.now();
+      activeDownloads.set(studio, Math.max(0, (activeDownloads.get(studio) || 1) - 1)); saveDownloadIndex();
+      assetsRevision++; publish();
+    });
   });
 }
 function createTab(studio, url, opener, inherited = {}) {
   const partition = STUDIOS[studio]?.partition || 'persist:automato-test';
   configureSession(partition);
-  const view = new WebContentsView({ ...(inherited.webContents ? { webContents: inherited.webContents } : {}), webPreferences: { ...inherited.webPreferences, partition, contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: true } });
-  const tab = { id: nextId++, studio, view, opener, generation: 0, error: null };
-  tabs.set(tab.id, tab); selected.set(studio, tab.id); window.contentView.addChildView(view);
+  const view = new WebContentsView({ ...(inherited.webContents ? { webContents: inherited.webContents } : {}), webPreferences: { ...inherited.webPreferences, partition, contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false } });
+  try { view.webContents.incrementCapturerCount(undefined, false, true); } catch {}
+  const tab = { id: nextId++, studio, view, opener, generation: 0, error: null, lastUsed: Date.now() };
+  tabs.set(tab.id, tab); selected.set(studio, tab.id); suspended.delete(studio); window.contentView.addChildView(view);
+  frontTab = null; // a new view lands on top; let updateBounds re-raise the on-screen studio
   const wc = view.webContents;
   wc.setWindowOpenHandler(details => {
     if (!['https:', 'http:'].includes(new URL(details.url).protocol) && !(fixtureMode && details.url.startsWith('file:'))) return { action: 'deny' };
-    return { action: 'allow', createWindow: options => { const child = createTab(studio, null, tab.id, options); activeStudio = studio; return child.view.webContents; } };
+    // Popups open inside their own studio; the screen only follows when that studio is already on screen.
+    return { action: 'allow', createWindow: options => { const child = createTab(studio, null, tab.id, options); return child.view.webContents; } };
   });
   wc.on('will-navigate', (event, url) => { if (!['http:', 'https:'].includes(new URL(url).protocol) && !(fixtureMode && url.startsWith('file:'))) event.preventDefault(); });
   wc.on('did-start-navigation', (_e, _url, _inPlace, mainFrame) => { if (mainFrame) { tab.generation++; tab.error = null; automation.invalidate(tab); } });
+  wc.on('input-event', () => touch(tab));
   for (const event of ['did-start-loading', 'did-stop-loading', 'page-title-updated', 'did-navigate-in-page']) wc.on(event, publish);
   wc.on('did-fail-load', (_e, code, description, _url, mainFrame) => { if (mainFrame && code !== -3) { tab.error = description; publish(); } });
   wc.on('destroyed', () => {
@@ -106,28 +266,79 @@ function createTab(studio, url, opener, inherited = {}) {
   return tab;
 }
 function switchStudio(id) {
-  if (!STUDIOS[id] && !(fixtureMode && id === 'test')) throw new Error('Unknown studio');
+  knownStudio(id);
   activeStudio = id;
-  if (!tabs.has(selected.get(id))) createTab(id, id === 'test' ? require('node:url').pathToFileURL(path.join(__dirname, 'fixture.html')).href : STUDIOS[id].url);
+  if (!tabs.has(selected.get(id))) {
+    const saved = suspended.get(id);
+    createTab(id, saved?.url || (id === 'test' ? require('node:url').pathToFileURL(path.join(__dirname, 'fixture.html')).href : STUDIOS[id].url));
+  }
+  touch(currentTab());
   updateBounds(); publish(); return state();
 }
 function listAssets() {
+  const byFile = new Map(downloadLog.map(record => [record.file, record]));
   return ['assets', 'downloads'].flatMap(source => fs.readdirSync(path.join(DATA, source), { withFileTypes: true }).filter(e => e.isFile()).map(e => {
     const file = path.join(DATA, source, e.name), stat = fs.statSync(file);
-    return { name: e.name, path: file, source, size: stat.size, modified: stat.mtimeMs };
+    const record = source === 'downloads' ? byFile.get(file) : null;
+    return { name: e.name, path: file, source, size: stat.size, modified: stat.mtimeMs, ...(record ? { studio: record.studio, owner: record.owner, state: record.state } : {}) };
   })).sort((a, b) => b.modified - a.modified);
 }
 function approvedOutput(file) {
-  if (!path.isAbsolute(file)) throw new Error('Use an absolute output path');
-  if (fs.existsSync(file)) throw new Error('Output exists; choose a new path');
+  if (!path.isAbsolute(file)) throw codedError('BAD_ARGS', 'Use an absolute output path');
+  if (fs.existsSync(file)) throw codedError('BAD_ARGS', 'Output exists; choose a new path');
   fs.mkdirSync(path.dirname(file), { recursive: true }); return file;
 }
 async function capture(args) {
   const file = approvedOutput(path.resolve(args.path || uniquePath(path.join(DATA, 'previews'), 'capture.png')));
-  const image = await (args.shell ? window.webContents : assertTab().view.webContents).capturePage();
-  if (image.isEmpty()) throw new Error('The page has no rendered content yet; wait for loading to finish');
-  fs.writeFileSync(file, image.toPNG(), { flag: 'wx' });
-  return { path: file, width: image.getSize().width, height: image.getSize().height, bytes: fs.statSync(file).size };
+  const wc = args.shell ? window.webContents : (await targetTab(args)).view.webContents;
+  let png, size, via = 'capturePage';
+  try {
+    const image = await wc.capturePage();
+    if (image.isEmpty()) throw new Error('The page has no rendered content yet; wait for loading to finish');
+    png = image.toPNG(); size = image.getSize();
+  } catch (error) {
+    // Minimized windows and background studios have no display surface: force repaints and retry, then render through DevTools with a time limit.
+    if (args.shell) throw error;
+    const limit = (p, ms) => Promise.race([p, new Promise((_, reject) => setTimeout(() => reject(new Error('capture timed out')), ms))]);
+    for (let i = 0; i < 4 && !png; i++) {
+      try { wc.invalidate(); } catch {}
+      await new Promise(resolve => setTimeout(resolve, 400));
+      try { const image = await limit(wc.capturePage(), 3000); if (!image.isEmpty()) { png = image.toPNG(); size = image.getSize(); via = 'capturePage-retry'; } } catch {}
+    }
+    if (!png) {
+      try {
+        if (!wc.debugger.isAttached()) { wc.debugger.attach('1.3'); try { await wc.debugger.sendCommand('Emulation.setFocusEmulationEnabled', { enabled: true }); } catch {} }
+        const shot = await limit(wc.debugger.sendCommand('Page.captureScreenshot', { format: 'png' }), 8000);
+        png = Buffer.from(shot.data, 'base64'); size = nativeImage.createFromBuffer(png).getSize(); via = 'devtools';
+      } catch { throw codedError('CAPTURE_FAILED', error.message); }
+    }
+  }
+  fs.writeFileSync(file, png, { flag: 'wx' });
+  return { path: file, width: size.width, height: size.height, bytes: fs.statSync(file).size, via };
+}
+async function navigate(tab, url) {
+  const wc = tab.view.webContents, before = wc.getURL(), target = validateUrl(url);
+  try { await wc.loadURL(target); }
+  catch (error) {
+    // ERR_ABORTED (-3) is usually a client-side redirect; succeed when the page really moved.
+    if (!/ERR_ABORTED|\(-3\)/.test(error.message)) throw error;
+    await waitLoaded(tab, 10000);
+    const now = wc.getURL();
+    if (!now || (now === before && now !== target)) throw codedError('NAV_ABORTED', error.message);
+  }
+}
+async function waitFor(tab, args) {
+  const wc = tab.view.webContents;
+  const ms = Math.min(60000, Math.max(500, (Number(args.timeout) || 20) * 1000));
+  const until = args.until || 'idle', value = args.value == null ? '' : String(args.value), deadline = Date.now() + ms;
+  if (until !== 'idle' && !value) throw codedError('BAD_ARGS', 'wait needs a value for ' + until);
+  while (Date.now() < deadline) {
+    if (until === 'idle' && !wc.isLoading()) return { ok: true, until, url: safeUrl(wc.getURL()) };
+    if (until === 'url-contains' && wc.getURL().includes(value)) return { ok: true, until, url: safeUrl(wc.getURL()) };
+    if (until === 'text') { const found = await automation.inspect(tab, { query: value, limit: 20 }); if (found.nodes.length) return { ok: true, until, ...found }; }
+    await new Promise(resolve => setTimeout(resolve, 400));
+  }
+  throw codedError('TIMEOUT', `Waited ${Math.round(ms / 1000)}s for ${until}${value ? ' "' + value + '"' : ''}`);
 }
 async function dispatch(command, args = {}) {
   if (args.dryRun && !['status', 'inspect', 'assets', 'tabs', 'studios'].includes(command)) return { dryRun: true, command };
@@ -136,26 +347,43 @@ async function dispatch(command, args = {}) {
     case 'studios': return state().studios;
     case 'switch': return switchStudio(args.studio);
     case 'tabs': return state().tabs;
-    case 'select-tab': { const tab = tabs.get(Number(args.id)); if (!tab) throw new Error('Tab not found'); activeStudio = tab.studio; selected.set(tab.studio, tab.id); updateBounds(); publish(); return state(); }
-    case 'close-tab': { const tab = tabs.get(Number(args.id)); if (!tab) throw new Error('Tab not found'); tab.view.webContents.close(); return { closed: tab.id }; }
-    case 'navigate': { const tab = assertTab(); await tab.view.webContents.loadURL(validateUrl(args.url)); return state(); }
-    case 'reload': assertTab().view.webContents.reload(); return { reloading: true };
-    case 'back': { const history = assertTab().view.webContents.navigationHistory; if (history.canGoBack()) history.goBack(); return { back: true }; }
-    case 'inspect': return automation.inspect(assertTab(), args);
-    case 'click': return automation.click(assertTab(), args.ref);
-    case 'fill': return automation.fill(assertTab(), args.ref, args.text);
+    case 'select-tab': { const tab = tabs.get(Number(args.id)); if (!tab) throw codedError('NO_TAB', 'Tab not found'); activeStudio = tab.studio; selected.set(tab.studio, tab.id); touch(tab); updateBounds(); publish(); return state(); }
+    case 'close-tab': { const tab = tabs.get(Number(args.id)); if (!tab) throw codedError('NO_TAB', 'Tab not found'); tab.view.webContents.close(); return { closed: tab.id }; }
+    case 'ensure': { if (!args.studio) throw codedError('BAD_ARGS', 'ensure needs a studio'); const tab = await targetTab(args); return { tab: tab.id, studio: tab.studio, url: safeUrl(tab.view.webContents.getURL()), loading: tab.view.webContents.isLoading() }; }
+    case 'navigate': { const tab = await targetTab(args); await navigate(tab, args.url); return state(); }
+    case 'reload': (await targetTab(args)).view.webContents.reload(); return { reloading: true };
+    case 'back': { const history = (await targetTab(args)).view.webContents.navigationHistory; if (history.canGoBack()) history.goBack(); return { back: true }; }
+    case 'wait': return waitFor(await targetTab(args), args);
+    // Type at the caret one character at a time, without selecting or replacing what is there. Editors that open a
+    // suggestion list while you type (TikTok's hashtag picker) only react to typed input, not to a replaced field.
+    case 'type': { const tab = await targetTab(args), text = String(args.text == null ? '' : args.text).slice(0, 2000), delay = Math.max(0, Math.min(500, Number(args.delay) || 60)); for (const ch of text) { await automation.cdp(tab, 'Input.insertText', { text: ch }); await new Promise(resolve => setTimeout(resolve, delay)); } return { typed: text.length }; }
+    case 'viewport': { const tab = await targetTab(args); tab.minWidth = Math.max(0, Math.min(3840, Math.round(Number(args.width) || 0))); updateBounds(); await new Promise(resolve => setTimeout(resolve, 600)); const b = tab.view.getBounds(); return { minWidth: tab.minWidth, width: b.width, height: b.height }; }
+    case 'inspect': return automation.inspect(await targetTab(args), args);
+    // v7: read-only list of the images on the page (address, natural size, alt text). The accessibility tree that
+    // `inspect` returns carries no image addresses, so review photos could be seen but not saved.
+    case 'images': { const tab = await targetTab(args), min = Math.max(0, Math.min(4000, Math.round(Number(args.min) || 0))); const { result } = await automation.cdp(tab, 'Runtime.evaluate', { expression: `JSON.stringify(Array.from(document.images).map(i => ({ src: i.currentSrc || i.src || '', w: i.naturalWidth, h: i.naturalHeight, alt: (i.alt || '').slice(0, 80) })).concat(Array.from(document.querySelectorAll('body *')).slice(0, 20000).map(e => { const m = /url\\(["']?(https?:[^"')]+)/.exec(getComputedStyle(e).backgroundImage || ''); if (!m) return null; const r = e.getBoundingClientRect(); return { src: m[1], w: Math.round(r.width), h: Math.round(r.height), alt: (e.getAttribute('aria-label') || '').slice(0, 80), bg: true }; }).filter(Boolean)).filter(i => /^https?:/.test(i.src) && i.w >= ${min} && i.h >= ${min}).slice(0, 800))`, returnByValue: true }); return { url: safeUrl(tab.view.webContents.getURL()), images: JSON.parse((result && result.value) || '[]') }; }
+    case 'click': return automation.click(refTab(args), args.ref);
+    case 'hover': return automation.hover(refTab(args), args.ref);
+    case 'fill': return automation.fill(refTab(args), args.ref, args.text);
     case 'press': {
       const keys = { Enter: ['Enter', 13], Tab: ['Tab', 9], Escape: ['Escape', 27], Backspace: ['Backspace', 8], Delete: ['Delete', 46], ArrowDown: ['ArrowDown', 40], ArrowUp: ['ArrowUp', 38], ArrowLeft: ['ArrowLeft', 37], ArrowRight: ['ArrowRight', 39] };
       const [key, code] = keys[args.key] || (String(args.key).length === 1 ? [args.key, String(args.key).toUpperCase().charCodeAt(0)] : []);
-      if (!key) throw new Error('Use Enter, Tab, Escape, Backspace, Delete, an Arrow key or a single character');
-      await automation.cdp(assertTab(), 'Input.dispatchKeyEvent', { type: 'keyDown', key, windowsVirtualKeyCode: code, modifiers: Number(args.modifiers) || 0 });
-      await automation.cdp(assertTab(), 'Input.dispatchKeyEvent', { type: 'keyUp', key, windowsVirtualKeyCode: code, modifiers: Number(args.modifiers) || 0 });
+      if (!key) throw codedError('BAD_ARGS', 'Use Enter, Tab, Escape, Backspace, Delete, an Arrow key or a single character');
+      const tab = await targetTab(args);
+      await automation.cdp(tab, 'Input.dispatchKeyEvent', { type: 'keyDown', key, windowsVirtualKeyCode: code, modifiers: Number(args.modifiers) || 0 });
+      await automation.cdp(tab, 'Input.dispatchKeyEvent', { type: 'keyUp', key, windowsVirtualKeyCode: code, modifiers: Number(args.modifiers) || 0 });
       return { pressed: key };
     }
-    case 'scroll': { const tab = assertTab(), size = tab.view.getBounds(); await automation.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mouseWheel', x: size.width / 2, y: size.height / 2, deltaX: 0, deltaY: Math.max(-3000, Math.min(3000, Number(args.delta) || 600)) }); return { scrolled: true }; }
-    case 'upload': { const files = args.files.map(file => { const resolved = path.resolve(file); if (!fs.statSync(resolved).isFile()) throw new Error('Upload requires files'); return resolved; }); return automation.upload(assertTab(), args.ref, files); }
+    case 'scroll': { const tab = await targetTab(args), size = tab.view.getBounds(); await automation.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mouseWheel', x: size.width / 2, y: size.height / 2, deltaX: 0, deltaY: Math.max(-3000, Math.min(3000, Number(args.delta) || 600)) }); return { scrolled: true }; }
+    case 'upload': { const tab = refTab(args); const files = args.files.map(file => { const resolved = path.resolve(file); if (!fs.statSync(resolved).isFile()) throw codedError('BAD_ARGS', 'Upload requires files'); return resolved; }); return automation.upload(tab, args.ref, files); }
+    case 'upload-picker': { const tab = refTab(args); if (!Array.isArray(args.files) || args.files.length !== 1) throw codedError('BAD_ARGS', 'Picker upload requires exactly one file'); const files = args.files.map(file => { if (!path.isAbsolute(file)) throw codedError('BAD_ARGS', 'Use absolute file paths'); const resolved = path.resolve(file); if (!fs.statSync(resolved).isFile()) throw codedError('BAD_ARGS', 'Upload requires files'); return resolved; }); return automation.uploadPicker(tab, args.ref, files); }
+    case 'lease': { knownStudio(args.studio); if (!args.owner) throw codedError('BAD_ARGS', 'lease needs an owner'); checkLease(args.studio, args.owner); return studioInfo(args.studio); }
+    case 'release': { knownStudio(args.studio); const held = lease(args.studio); const released = !!held && held.owner === String(args.owner); if (released) { leases.delete(args.studio); publish(); } return { released, ...studioInfo(args.studio) }; }
+    case 'suspend': return suspendStudio(args.studio, 'manual');
+    case 'wake': { const tab = await targetTab({ studio: args.studio, owner: args.owner }); return { woke: tab.studio, tab: tab.id, url: safeUrl(tab.view.webContents.getURL()) }; }
+    case 'suspend-settings': { if (Object.keys(args).length) { suspendSettings = normalizeSuspend(args, suspendSettings); fs.writeFileSync(suspendFile, JSON.stringify(suspendSettings)); publish(); } return suspendSettings; }
     case 'assets': return listAssets();
-    case 'import': { const files = args.files || []; const imported = files.map(file => { if (!path.isAbsolute(file) || !fs.statSync(file).isFile()) throw new Error('Use absolute file paths'); const target = uniquePath(path.join(DATA, 'assets'), path.basename(file)); fs.copyFileSync(file, target, fs.constants.COPYFILE_EXCL); return target; }); assetsRevision++; publish(); return { imported }; }
+    case 'import': { const files = args.files || []; const imported = files.map(file => { if (!path.isAbsolute(file) || !fs.statSync(file).isFile()) throw codedError('BAD_ARGS', 'Use absolute file paths'); const target = uniquePath(path.join(DATA, 'assets'), path.basename(file)); fs.copyFileSync(file, target, fs.constants.COPYFILE_EXCL); return target; }); assetsRevision++; publish(); return { imported }; }
     case 'panels': { layout = normalizeLayout(args, layout); fs.writeFileSync(settingsFile, JSON.stringify(layout)); publish(); return layout; }
     case 'appearance': {
       if (Object.keys(args).length) { appearance = args.reset ? { ...DEFAULT_APPEARANCE } : normalizeAppearance(args, appearance); fs.writeFileSync(appearanceFile, JSON.stringify(appearance)); publish(); }
@@ -165,10 +393,10 @@ async function dispatch(command, args = {}) {
     case 'storage-window': openAppearance('storage'); return { opened: true };
     case 'storage': return { dataDir: DATA, configured: !storage.setupRequired, launchOverride: storage.explicit, setup: !!setupWindow, hasExistingData: hadWorkspace, restartPending, recovery: storage.recovery || null };
     case 'screenshot': return capture(args);
-    case 'window': { if (args.action === 'minimize') window.minimize(); else if (args.action === 'maximize') window.isMaximized() ? window.unmaximize() : window.maximize(); else if (args.action === 'close') window.close(); return { ok: true }; }
+    case 'window': { if (args.action === 'minimize') window.minimize(); else if (args.action === 'restore') { if (window.isMinimized()) window.restore(); window.showInactive(); } else if (args.action === 'maximize') window.isMaximized() ? window.unmaximize() : window.maximize(); else if (args.action === 'close') window.close(); return { ok: true }; }
     case 'quit': setImmediate(() => app.quit()); return { quitting: true };
     case 'test-state': { if (!fixtureMode || !assertTab().view.webContents.getURL().endsWith('fixture.html')) throw new Error('Only available in isolated test mode'); return assertTab().view.webContents.executeJavaScript(`({ text: document.querySelector('#typed').textContent, result: document.querySelector('#result').textContent, attached: document.querySelector('#attached').textContent, scroll: scrollY, width: innerWidth, height: innerHeight })`); }
-    default: throw new Error('Unknown command');
+    default: throw codedError('BAD_ARGS', 'Unknown command');
   }
 }
 function openAppearance(tab = 'appearance') {
@@ -256,6 +484,7 @@ else {
     await window.loadFile(path.join(__dirname, 'index.html'));
     switchStudio(activeStudio);
     bridge = await createBridge(DATA, dispatch);
+    setInterval(autoSuspend, 60000);
   }).catch(error => { console.error(error.message); app.quit(); });
 }
 app.on('window-all-closed', () => app.quit());

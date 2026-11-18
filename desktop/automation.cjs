@@ -4,8 +4,13 @@ let nextSnapshot = 1;
 class PageAutomation {
   constructor() { this.references = new Map(); }
   async cdp(tab, method, args = {}) {
-    if (!tab.view.webContents.debugger.isAttached()) tab.view.webContents.debugger.attach('1.3');
-    return tab.view.webContents.debugger.sendCommand(method, args);
+    const dbg = tab.view.webContents.debugger;
+    if (!dbg.isAttached()) {
+      dbg.attach('1.3');
+      // Background studios lack OS focus; emulate focus so menus, popovers and key events behave as on screen.
+      try { await dbg.sendCommand('Emulation.setFocusEmulationEnabled', { enabled: true }); } catch {}
+    }
+    return dbg.sendCommand(method, args);
   }
   invalidate(tab) {
     for (const [ref, value] of this.references) if (value.tab === tab) this.references.delete(ref);
@@ -19,11 +24,14 @@ class PageAutomation {
     walk(tree.frameTree);
     const nodes = []; const warnings = [];
     const limit = Math.min(1000, Math.max(10, Number(args.limit) || 250));
+    // offset skips that many compacted nodes per frame, so callers can read past the 1000-node window
+    // (e.g. a dialog rendered after a long list). Refs are still issued only for returned nodes.
+    const offset = Math.max(0, Math.floor(Number(args.offset) || 0));
     for (const frame of frames) {
       if (args.frame && frame.id !== args.frame) continue;
       try {
         const result = await this.cdp(tab, 'Accessibility.getFullAXTree', { frameId: frame.id });
-        for (const node of compactAX(result.nodes, 1000)) {
+        for (const node of compactAX(result.nodes, 1000 + offset).slice(offset)) {
           if (args.query && !`${node.role} ${node.name}`.toLowerCase().includes(String(args.query).toLowerCase())) continue;
           if (nodes.length >= limit) break;
           const ref = node.backendId ? `s${snapshot}e${nodes.length + 1}` : undefined;
@@ -73,6 +81,17 @@ class PageAutomation {
       return response.result.value;
     } finally { await this.cdp(tab, 'Runtime.releaseObject', { objectId }).catch(() => {}); }
   }
+  async hover(tab, ref) {
+    // Move the pointer over an element so hover-only toolbars (e.g. download buttons) appear.
+    const value = this.resolve(tab, ref);
+    await this.cdp(tab, 'DOM.scrollIntoViewIfNeeded', { backendNodeId: value.backendNodeId });
+    const { quads } = await this.cdp(tab, 'DOM.getContentQuads', { backendNodeId: value.backendNodeId });
+    if (!quads?.length) throw new Error('Element is not visible; inspect again or scroll first');
+    const q = quads[0], x = (q[0] + q[2] + q[4] + q[6]) / 4, y = (q[1] + q[3] + q[5] + q[7]) / 4;
+    await this.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: x - 5, y: y - 5 });
+    await this.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+    return { hovered: ref };
+  }
   async click(tab, ref) {
     const value = this.resolve(tab, ref);
     await this.cdp(tab, 'DOM.scrollIntoViewIfNeeded', { backendNodeId: value.backendNodeId });
@@ -91,6 +110,32 @@ class PageAutomation {
     if (!valid) throw new Error('Element is not a text field');
     await this.cdp(tab, 'Input.insertText', { text: String(text) });
     return { filled: ref };
+  }
+  async uploadPicker(tab, ref, files) {
+    if (!Array.isArray(files) || files.length !== 1) throw new Error('Picker upload requires exactly one approved file');
+    this.resolve(tab, ref);
+    const dbg = tab.view.webContents.debugger;
+    await this.cdp(tab, 'Page.enable');
+    await this.cdp(tab, 'Page.setInterceptFileChooserDialog', { enabled: true });
+    let timer, listener;
+    const opened = new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error('No file chooser event from selected upload control')), 8000);
+      listener = (_event, method, params) => { if (method === 'Page.fileChooserOpened') resolve(params); };
+      dbg.on('message', listener);
+    });
+    try {
+      await this.click(tab, ref);
+      const chooser = await opened;
+      if (!chooser.backendNodeId) throw new Error('Chooser has no file-input backend node');
+      const { node } = await this.cdp(tab, 'DOM.describeNode', { backendNodeId: chooser.backendNodeId });
+      const attrs = node.attributes || [];
+      if (node.nodeName !== 'INPUT' || !attrs.some((v, i) => i % 2 === 0 && v === 'type' && attrs[i + 1] === 'file')) throw new Error('Chooser target is not a file input');
+      await this.cdp(tab, 'DOM.setFileInputFiles', { backendNodeId: chooser.backendNodeId, files });
+      return { attached: files.length, mechanism: 'file-chooser-event', backendNodeId: chooser.backendNodeId, frameId: chooser.frameId };
+    } finally {
+      clearTimeout(timer); if (listener) dbg.removeListener('message', listener);
+      await this.cdp(tab, 'Page.setInterceptFileChooserDialog', { enabled: false }).catch(() => {});
+    }
   }
   async upload(tab, ref, files) {
     const value = this.resolve(tab, ref);
